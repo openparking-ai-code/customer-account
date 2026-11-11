@@ -1,0 +1,303 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  lint:
+    name: lint
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # Full history, as emails.yml already does and for the same reason.
+          # The sibling-name guard below reads COMMIT MESSAGES as well as files.
+          # At the default depth of 1 a pull-request checkout is one synthetic
+          # merge commit, so the guard's commit half would see nothing.
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - run: pip install -e '.[dev]'
+      - run: ruff check .
+
+      - uses: actions/setup-node@v4
+        with: { node-version: '22' }
+
+      - name: No real personal data in the repository
+        # The self-test first: before trusting the result, prove the check can
+        # fail. It plants a real-looking address and requires a rejection.
+        run: |
+          node .github/scripts/check-no-real-data.js --self-test
+          node .github/scripts/check-no-real-data.js
+
+      - name: No name from the maintainer's other software (self-test)
+        run: node .github/scripts/check-no-sibling-names.js --self-test
+
+      - name: No name from the maintainer's other software (this pull request)
+        if: github.event_name == 'pull_request'
+        env:
+          BASE: ${{ github.event.pull_request.base.sha }}
+          HEAD: ${{ github.event.pull_request.head.sha }}
+        run: node .github/scripts/check-no-sibling-names.js "$BASE..$HEAD"
+
+      - name: No name from the maintainer's other software (whole history)
+        if: github.event_name != 'pull_request'
+        run: node .github/scripts/check-no-sibling-names.js
+
+      - name: No name from the maintainer's other software (working tree)
+        # Tracked and untracked files, contents and paths, and every commit
+        # message. Plants its own controls -- a word in a file, a word in a
+        # file's name -- and requires each caught, in the same run, before the
+        # real scan is read.
+        run: node .github/scripts/check-no-sibling-names.js --worktree
+
+  test:
+    name: test
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        # The lowest version supported and a current one. Nothing here may
+        # quietly depend on a newer interpreter than an integrator's.
+        python-version: ['3.11', '3.12']
+
+    services:
+      postgres:
+        # The row-level security guarantee is about the database CATALOGUE, the
+        # append-only histories are GRANTS, and there is no way to read either
+        # without a database. This service is what stops those guarantees'
+        # tests skipping. Host connections to the service are scram, so "the
+        # password works" is measured and not assumed.
+        image: postgres:16
+        env:
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: customer_account_test
+        ports: ['5432:5432']
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 10
+
+    steps:
+      - uses: actions/checkout@v4
+        with: { persist-credentials: false }
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      - name: Install
+        run: pip install -e '.[dev]'
+
+      - name: The module has no dependencies, and that is a published claim
+        # `pip install -e .` with no extras must leave nothing but the package
+        # itself. The `store` extra is exempt BY NAME rather than by the check
+        # being loose: a driver belongs there, and nowhere else.
+        run: |
+          python - <<'PY'
+          import importlib.metadata as md
+          requires = md.distribution("openparking-customer-account").requires or []
+          runtime = [r for r in requires if "extra ==" not in r]
+          assert runtime == [], f"the runtime dependency list is no longer empty: {runtime}"
+          extras = sorted({
+              r.split("extra ==")[1].strip().strip('"\'')
+              for r in requires if "extra ==" in r
+          })
+          assert extras == ["dev", "store"], f"unexpected extras: {extras}"
+          print("no runtime dependencies, as published")
+          PY
+
+      - name: The suite
+        # NO ALLOWANCE IS NAMED, deliberately. CUSTOMER_ACCOUNT_ALLOW_UNRUN is the
+        # only way a registered guarantee may finish a run unproven, and it is
+        # empty here -- so a guarantee whose test did not run and pass fails
+        # this step.
+        env:
+          CUSTOMER_ACCOUNT_TEST_DSN: >-
+            host=localhost port=5432 dbname=customer_account_test
+            user=postgres password=postgres
+        run: pytest -q
+
+      - name: The database tests really ran, rather than skipping
+        # The step above fails on an unrun GUARANTEE. This is the narrower check
+        # on the same thing: a skipped Postgres test and a passing one both
+        # leave the suite green if the guarantee guard is ever loosened.
+        env:
+          CUSTOMER_ACCOUNT_TEST_DSN: >-
+            host=localhost port=5432 dbname=customer_account_test
+            user=postgres password=postgres
+        run: |
+          set -o pipefail
+          pytest -q -m needs_postgres | tee "$RUNNER_TEMP/db.txt"
+          grep -qE '[0-9]+ passed' "$RUNNER_TEMP/db.txt"
+          if grep -q 'skipped' "$RUNNER_TEMP/db.txt"; then
+            echo "a database test skipped, so the isolation guarantee is unproven:"
+            cat "$RUNNER_TEMP/db.txt"; exit 1
+          fi
+
+      - name: The command line works with nothing but this package and a database
+        # The definition of done for a standalone module, as a check: someone
+        # with no parking system migrates a database, points the command line
+        # at it and gets an answer. EVERY exit status is asserted, and the
+        # non-zero ones are the ones that matter: a check that only ever runs
+        # the happy path cannot tell a working refusal from one that reports
+        # nothing. The migrations and the install step are the README's own
+        # steps, run as published; the tenant row is seeded as the owner, as
+        # the README says it is.
+        env:
+          OWNER_DSN: host=localhost port=5432 dbname=customer_account_test user=postgres password=postgres
+          CUSTOMER_ACCOUNT_APP_PASSWORD: app-password-for-this-run
+        run: |
+          set -o pipefail
+          python - <<'PY'
+          import glob, os, psycopg
+          with psycopg.connect(os.environ["OWNER_DSN"], autocommit=True) as c:
+              c.execute("DROP SCHEMA public CASCADE; CREATE SCHEMA public;")
+              c.execute("CREATE EXTENSION IF NOT EXISTS pgcrypto;")
+              for path in sorted(glob.glob("migrations/*.sql")):
+                  c.execute(open(path).read())
+              c.execute("INSERT INTO tenants (id, slug, name) VALUES "
+                        "('00000000-0000-0000-0000-000000000001', 'ci', 'ci')")
+          PY
+          python scripts/ensure-app-role.py "$OWNER_DSN"
+          export CUSTOMER_ACCOUNT_DSN="host=localhost port=5432 dbname=customer_account_test user=customer_account_app password=$CUSTOMER_ACCOUNT_APP_PASSWORD"
+          T="--tenant 00000000-0000-0000-0000-000000000001"
+          AT="--at 2026-06-01T09:00:00-06:00"
+          echo "Version 1 of the terms." > "$RUNNER_TEMP/terms.txt"
+          echo "We will text you." > "$RUNNER_TEMP/sms.txt"
+
+          # An account with its acceptance: exit 0, and the customer's id comes back.
+          customer-account create-account $T --email holder@example.com --by self $AT \
+            --terms-version v1 --terms-shown "$RUNNER_TEMP/terms.txt" \
+            --channel "sms=$RUNNER_TEMP/sms.txt" | tee "$RUNNER_TEMP/created.txt"
+          CID=$(python -c "import json,sys; print(json.load(open(sys.argv[1]))['customer'])" "$RUNNER_TEMP/created.txt")
+
+          # The same address again is refused by name: exit 3.
+          if customer-account create-account $T --email HOLDER@example.com --by self $AT \
+               --terms-version v1 --terms-shown "$RUNNER_TEMP/terms.txt" | tee "$RUNNER_TEMP/taken.txt"; then
+            echo "a second account behind one address was created"; exit 1
+          fi
+          grep -q '"REFUSAL_EMAIL_TAKEN"' "$RUNNER_TEMP/taken.txt"
+
+          # No credential yet: verify answers NO_CREDENTIAL by name, exit 1 -- and
+          # it is NOT exit 0. This is the positive control for the line below.
+          export CUSTOMER_ACCOUNT_PASSWORD="Correct-horse-battery-1"
+          if customer-account verify-password $T --customer "$CID" | tee "$RUNNER_TEMP/none.txt"; then
+            echo "a customer with no credential verified"; exit 1
+          fi
+          grep -q '"NO_CREDENTIAL"' "$RUNNER_TEMP/none.txt"
+          grep -q "no password required" "$RUNNER_TEMP/none.txt"
+
+          # Set it, verify it: exit 0. A wrong one: exit 1, by name.
+          customer-account set-password $T --customer "$CID" --by ops $AT > /dev/null
+          customer-account verify-password $T --customer "$CID" | grep -q '"VERIFIED"'
+          CUSTOMER_ACCOUNT_PASSWORD="not the one, surely" customer-account verify-password $T --customer "$CID" \
+            > "$RUNNER_TEMP/wrong.txt" && { echo "a wrong password verified"; exit 1; }
+          test $? -eq 1 || { echo "expected exit 1"; cat "$RUNNER_TEMP/wrong.txt"; exit 1; }
+          grep -q '"WRONG_PASSWORD"' "$RUNNER_TEMP/wrong.txt"
+
+          # A reset goes to the CURRENT address, and the token is printed once.
+          # It is presented back on standard input, never as an argument.
+          customer-account start-password-reset $T --customer "$CID" --valid-minutes 30 --by ops $AT \
+            | tee "$RUNNER_TEMP/reset.txt"
+          grep -q '"deliver_to": "holder@example.com"' "$RUNNER_TEMP/reset.txt"
+          TOKEN=$(python -c "import json,sys; print(json.load(open(sys.argv[1]))['token'])" "$RUNNER_TEMP/reset.txt")
+          printf '%s\n' "$TOKEN" | CUSTOMER_ACCOUNT_PASSWORD="A-brand-new-passphrase-2" \
+            customer-account consume-password-reset $T --at 2026-06-01T09:10:00-06:00 | grep -q '"replaced"'
+          if printf '%s\n' "$TOKEN" | customer-account consume-password-reset $T --at 2026-06-01T09:11:00-06:00 \
+               | tee "$RUNNER_TEMP/used.txt"; then
+            echo "a token was spent twice"; exit 1
+          fi
+          grep -q '"REFUSAL_TOKEN_ALREADY_USED"' "$RUNNER_TEMP/used.txt"
+
+          # No DSN: one sentence on stderr, exit 2, nothing on stdout.
+          unset CUSTOMER_ACCOUNT_DSN
+          customer-account show-account $T --customer "$CID" > "$RUNNER_TEMP/out.txt" 2> "$RUNNER_TEMP/err.txt" && {
+            echo "a command ran with no DSN"; exit 1; }
+          test $? -eq 2 || { echo "expected exit 2"; cat "$RUNNER_TEMP/err.txt"; exit 1; }
+          test ! -s "$RUNNER_TEMP/out.txt"
+          grep -q "CUSTOMER_ACCOUNT_DSN is not set" "$RUNNER_TEMP/err.txt"
+
+          echo "the module answered, and refused, for the right reasons"
+
+  controls:
+    name: controls
+    runs-on: ubuntu-latest
+
+    services:
+      postgres:
+        # Several controls plant into the migration, so they need the same
+        # database the suite does. Without it those targets all SKIP, the
+        # control cannot fire, and fail_controls.py reports it DEAD and exits 1.
+        image: postgres:16
+        env:
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: customer_account_test
+        ports: ['5432:5432']
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 10
+
+    steps:
+      - uses: actions/checkout@v4
+        with: { persist-credentials: false }
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - run: pip install -e '.[dev]'
+
+      - name: Anchor pre-flight
+        # Each fail-control plants a string into a source file. Editing the line
+        # an anchor sits on silently retires the control that depends on it.
+        # This answers that whole failure mode in a second, before the controls
+        # themselves run -- and it is a separate step so a failure is visible.
+        run: python scripts/fail_controls.py --anchors
+
+      - name: Every guarantee, proven able to FAIL
+        # Breaks the thing each guarantee guards and requires red. No count is
+        # written here on purpose: the script derives the set from
+        # tests/_guarantees.py and refuses to run if a guarantee has no control.
+        env:
+          CUSTOMER_ACCOUNT_TEST_DSN: >-
+            host=localhost port=5432 dbname=customer_account_test
+            user=postgres password=postgres
+        run: python scripts/fail_controls.py
+
+      - name: The working tree is unchanged after every defect was planted
+        run: git diff --exit-code
+
+  docs:
+    name: docs
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with: { persist-credentials: false }
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - run: pip install -e '.[dev]'
+
+      - name: Every published figure AND SENTENCE is still the generated one
+        # docs/CONTRACT.md's marked blocks are DERIVED. A number or a sentence
+        # edited by hand turns this red.
+        run: |
+          python scripts/generate_contract.py --check
+          git diff --exit-code docs/CONTRACT.md
+
+      - name: Generation is not verification
+        # The step above proves the document matches the generator. These tests
+        # plant values that contradict the prose and require the prose to change.
+        run: |
+          set -o pipefail
+          pytest tests/test_contract_is_generated.py -q | tee "$RUNNER_TEMP/docs.txt"
+          if grep -q 'skipped' "$RUNNER_TEMP/docs.txt"; then
+            echo "a contract plant skipped, so the derivation is unproven:"; exit 1
+          fi
